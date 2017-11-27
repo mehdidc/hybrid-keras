@@ -5,30 +5,43 @@ from keras.layers.core import Activation
 from keras.layers.normalization import BatchNormalization
 from keras.layers.convolutional import UpSampling2D
 from keras.layers.convolutional import Convolution2D, MaxPooling2D
-from keras.layers.core import Flatten
-from keras.optimizers import SGD
+from keras.layers.core import Flatten,  Lambda
+from keras.optimizers import SGD, Adam
+from keras import backend as K
+
 from keras.datasets import mnist
 import numpy as np
 from PIL import Image
 import argparse
 import math
+
+from keras.layers.advanced_activations import LeakyReLU
 from skimage.transform import resize
+
+def resize_set(x, w, h, **kw):
+    x_out = np.empty((x.shape[0], 1, w, h))
+    for i in range(len(x)):
+        x_out[i, 0] = resize(x[i, 0], (w, h), **kw)
+    return x_out.astype(np.float32)
+
+leaky_relu = LeakyReLU(alpha=0.3)
 
 def generator_model():
     model = Sequential()
     model.add(Dense(input_dim=100, output_dim=1024))
-    model.add(Activation('tanh'))
+    model.add(leaky_relu)
     model.add(Dense(128*7*7))
     model.add(BatchNormalization())
-    model.add(Activation('tanh'))
+    model.add(leaky_relu)
     model.add(Reshape((128, 7, 7), input_shape=(128*7*7,)))
     model.add(UpSampling2D(size=(2, 2)))
     model.add(Convolution2D(64, 5, 5, border_mode='same'))
-    model.add(Activation('tanh'))
+    model.add(leaky_relu)
     model.add(UpSampling2D(size=(2, 2)))
     model.add(Convolution2D(1, 5, 5, border_mode='same'))
     model.add(Activation('sigmoid'))
     return model
+
 
 def discriminator_model():
     model = Sequential()
@@ -48,12 +61,45 @@ def discriminator_model():
     model.add(Activation('sigmoid'))
     return model
 
+def sample_std_objectness(v):
+    eps = 1e-8
+    marginal = v.mean(axis=0)
+    score = (v).std(axis=1)
+    return score 
+
+def sample_objectness_v2(v):
+    return v[:, 0]
+
+def sample_objectness(v):
+    eps = 1e-8
+    #marginal = v.mean(axis=0)
+    #score = (v * K.log(v / (marginal + eps)))
+    score = v * K.log(v)
+    score = score.sum(axis=1)
+    return score 
+   
+def objectness(v):
+    eps = 1e-8
+    marginal = v.mean(axis=0)
+    score = (v * K.log(v / (marginal + eps)))
+    score = score.sum(axis=1).mean()
+    return score 
+
+def output_shape_objectness(input_shape):
+    return (input_shape[0], 1)
+
+def output_shape_class_get(input_shape):
+    return (input_shape[0], 1)
+
 def generator_containing_discriminator(generator, discriminator):
     model = Sequential()
     model.add(generator)
     discriminator.trainable = False
     model.add(discriminator)
+    #model.add(Lambda(objectness, output_shape=output_shape_objectness))
+    #model.add(Lambda(class_get, output_shape=output_shape_class_get))
     return model
+
 
 def combine_images(generated_images):
     num = generated_images.shape[0]
@@ -69,13 +115,20 @@ def combine_images(generated_images):
             img[0, :, :]
     return image
 
-def resize_set(x, w, h, **kw):
-    x_out = np.empty((x.shape[0], 1, w, h))
-    for i in range(len(x)):
-        x_out[i, 0] = resize(x[i, 0], (w, h), **kw)
-    return x_out.astype(np.float32)
+
 
 def train(BATCH_SIZE):
+    from keras.models import model_from_json 
+    from datakit import mnist
+    """
+    data = mnist.load(which='train')
+    X_train = data['train']['X']
+    y_train = data['train']['y']
+    X_train = X_train.astype(np.float32) / 255.
+    iprint(X_train.min(), X_train.max())
+    X_train = X_train.reshape((X_train.shape[0], 1) + X_train.shape[1:])
+    X_train = X_train[(y_train==6)|(y_train==9)] 
+    """
     X, y = np.load('/home/mcherti/work/data/fonts/ds_all_32.npy')
     X = np.array(X.tolist())
     y = np.array(y.tolist())
@@ -87,20 +140,35 @@ def train(BATCH_SIZE):
     X = X[indices]
     X_train = X
     print(X_train.shape)
-
-    discriminator = discriminator_model()
+    #discriminator = discriminator_model()
+    js = open('../../feature_generation/tools/models/mnist/m2/model.json').read()
+    js = js.replace('softmax', 'linear')
+    discriminator = model_from_json(js)
+    discriminator.load_weights('../../feature_generation/tools/models/mnist/m2/model.h5')
     generator = generator_model()
+
     discriminator_on_generator = \
         generator_containing_discriminator(generator, discriminator)
-    d_optim = SGD(lr=0.0005, momentum=0.9, nesterov=True)
-    g_optim = SGD(lr=0.0005, momentum=0.9, nesterov=True)
+    
+    #d_optim = SGD(lr=0.0005, momentum=0.9, nesterov=True)
+    d_optim = Adam(lr=0.0002, beta_1=0.5)
+    #g_optim = SGD(lr=0.0005, momentum=0.9, nesterov=True)
+    g_optim = Adam(lr=0.0002, beta_1=0.5)
+
+    #d_optim = adam(lr=0)
     generator.compile(loss='binary_crossentropy', optimizer="SGD")
+    def loss(y_true, y_pred):
+        return (-sample_objectness_v2(y_pred)).mean()
     discriminator_on_generator.compile(
-        loss='binary_crossentropy', optimizer=g_optim)
-    discriminator.trainable = True
-    discriminator.compile(loss='binary_crossentropy', optimizer=d_optim)
+        loss=loss, optimizer=g_optim)
+    
+    discriminator.trainable = False
+    def loss(y_true, y_pred):
+        y_true = y_true[:, 0]
+        return (  y_true    *    (-sample_objectness_v2(y_pred))       ).mean()
+    discriminator.compile(loss=loss, optimizer=d_optim)
     noise = np.zeros((BATCH_SIZE, 100))
-    for epoch in range(100):
+    for epoch in range(1000000):
         print("Epoch is", epoch)
         print("Number of batches", int(X_train.shape[0]/BATCH_SIZE))
         for index in range(int(X_train.shape[0]/BATCH_SIZE)):
@@ -112,9 +180,11 @@ def train(BATCH_SIZE):
                 image = combine_images(generated_images)
                 image = image*255.
                 Image.fromarray(image.astype(np.uint8)).save(
-                        'orig/{:04d}{:05d}.png'.format(epoch, index))
+                    'modif/{:04d}{:05d}.png'.format(epoch, index))
             X = np.concatenate((image_batch, generated_images))
-            y = [1] * BATCH_SIZE + [0] * BATCH_SIZE
+            y = np.ones((X.shape[0], 10))
+            y[0:BATCH_SIZE] = 1
+            y[BATCH_SIZE:] = -1
             d_loss = discriminator.train_on_batch(X, y)
             print("batch %d d_loss : %f" % (index, d_loss))
             for i in range(BATCH_SIZE):
@@ -122,12 +192,11 @@ def train(BATCH_SIZE):
             discriminator.trainable = False
             g_loss = discriminator_on_generator.train_on_batch(
                 noise, [1] * BATCH_SIZE)
-            discriminator.trainable = True
+            discriminator.trainable = False
             print("batch %d g_loss : %f" % (index, g_loss))
             #if index % 10 == 9:
             #    generator.save_weights('generator', True)
             #    discriminator.save_weights('discriminator', True)
-
 
 def generate(BATCH_SIZE, nice=False):
     generator = generator_model()
